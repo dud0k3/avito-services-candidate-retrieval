@@ -1,0 +1,4 @@
+*.parquet
+*.zip
+answer.csv
+__pycache__/
