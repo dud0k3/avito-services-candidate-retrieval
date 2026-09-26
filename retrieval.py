@@ -1,9 +1,3 @@
-"""Local candidate retrieval for Avito service ads.
-
-Run with ``--validate`` to evaluate on held-out query contexts from train,
-or without it to write predictions for the benchmark queries.
-"""
-
 from __future__ import annotations
 
 import argparse
