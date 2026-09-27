@@ -1,11 +1,3 @@
-"""Matched seed-17 comparison of lexical and fine-tuned MiniLM retrieval.
-
-Builds a TF-IDF pool and a TF-IDF ∪ MiniLM pool, trains one CatBoost reranker
-for each, and evaluates both on the exact same held-out query contexts.
-Requires the locally fine-tuned SentenceTransformer checkpoint and aligned
-float16 item embeddings produced by evaluate_finetuned_minilm.py.
-"""
-
 from __future__ import annotations
 
 import argparse
