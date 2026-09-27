@@ -1,4 +1,4 @@
-"""Create the benchmark answer with the best locally validated TF-IDF/MiniLM blend."""
+"""создаем ответы, смешивая обычный поиск и модель."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ DENSE_WEIGHT = 0.60
 
 
 def rank_fraction(scores: np.ndarray) -> np.ndarray:
+    # ставим каждому объявлению место в списке: выше оценка — лучше место.
     order = np.argsort(scores, kind="stable")
     ranks = np.empty(len(scores), dtype=np.float32)
     ranks[order] = np.arange(len(scores), dtype=np.float32)
@@ -30,6 +31,7 @@ def rank_fraction(scores: np.ndarray) -> np.ndarray:
 
 
 def select_local(ids: np.ndarray, scores: np.ndarray, local: np.ndarray) -> np.ndarray:
+    # сначала выбираем объявления из города запроса, потом добираем другие.
     selected = top_indices(ids[local], scores[local], 50)
     if len(selected) < 50:
         other = top_indices(ids[~local], scores[~local], 50 - len(selected))
@@ -48,10 +50,12 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     torch.set_num_threads(8)
+    # читаем запросы и объявления, для которых нужно составить ответ.
     queries = pd.read_parquet(args.data_dir / "benchmark_queries.parquet")
     items = pd.read_parquet(args.data_dir / "benchmark_items.parquet", columns=ITEM_COLS)
     retriever = CandidateRetriever(items)
 
+    # готовим модель и считаем векторы заголовков и параметров объявлений.
     model = SentenceTransformer(str(args.model_dir), device=args.device)
     model.max_seq_length = 64
     documents = [build_document(row) for row in items.itertuples(index=False)]
@@ -66,6 +70,7 @@ def main() -> None:
     ).astype(np.float32)
     del model, documents
 
+    # добавляем кандидатов из поиска по словам.
     LOG.info("Finding lexical candidates for %s queries", len(queries))
     _, lexical_pools = retriever.retrieve(queries, return_pools=True)
     query_matrices = {
@@ -77,6 +82,7 @@ def main() -> None:
         for name, vectorizer in retriever.vectorizers.items()
     }
     item_tensor = torch.tensor(item_vectors, device=args.device, dtype=torch.float16)
+    # соединяем два списка кандидатов и готовим ответы для запросов.
     predictions: list[list[str]] = []
 
     for query_index, query in enumerate(queries.itertuples(index=False)):
@@ -118,6 +124,7 @@ def main() -> None:
         if (query_index + 1) % 100 == 0:
             LOG.info("Processed %s/%s queries", query_index + 1, len(queries))
 
+    # собираем таблицу и проверяем ее перед сохранением.
     answer = pd.DataFrame({
         "query_id": queries.query_id.astype(str),
         "answer": [" ".join(ids) for ids in predictions],

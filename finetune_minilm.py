@@ -1,4 +1,4 @@
-"""Fine-tune a local MiniLM bi-encoder on Avito query/clicked-item pairs."""
+"""дообучаем модель на запросах и выбранных объявлениях."""
 
 from __future__ import annotations
 
@@ -20,12 +20,14 @@ LOG = logging.getLogger(__name__)
 
 
 def build_query(row) -> str:
+    # добавляем фильтр к запросу, если пользователь его указал.
     query = clean_text(row.search_query)
     filters = clean_text(row.search_infm_params_text, 250)
     return f"{query} [filters] {filters}" if filters else query
 
 
 def build_document(row) -> str:
+    # для объявления берем заголовок и его параметры.
     title = clean_text(row.item_title_raw, 100)
     params = clean_text(row.item_infm_params_text, 300)
     return f"{title} [params] {params}" if params else title
@@ -46,6 +48,7 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    # читаем обучающие строки и оставляем отдельные запросы для проверки.
     cols = list(dict.fromkeys(QUERY_COLS + ITEM_COLS))
     train = pd.read_parquet(args.data_dir / "train.parquet", columns=cols)
     validation_queries, _ = make_validation(train, 600, args.seed)
@@ -58,8 +61,7 @@ def main():
     fit_pairs = fit_pairs.groupby("signature", sort=False, group_keys=False).sample(
         n=1, random_state=args.seed
     )
-    # MultipleNegativesRankingLoss treats other batch items as negatives. Use
-    # each clicked item at most once to avoid accidental in-batch false negatives.
+    # не повторяем одно объявление, чтобы пары в одной пачке не мешали обучению.
     fit_pairs = fit_pairs.drop_duplicates("item_id")
     fit_pairs = fit_pairs.sample(
         n=min(args.max_pairs, len(fit_pairs)), random_state=args.seed
@@ -67,10 +69,12 @@ def main():
     LOG.info("Fine-tuning on %s query/item pairs; validation contexts excluded",
              len(fit_pairs))
 
+    # превращаем строки в пары текста для обучения.
     examples = [
         InputExample(texts=[build_query(row), build_document(row)])
         for row in fit_pairs.itertuples(index=False)
     ]
+    # загружаем готовую открытую модель и настраиваем длину текста.
     model = SentenceTransformer(str(args.model_dir), device="cpu")
     model.max_seq_length = 64
     loss_fn = MultipleNegativesRankingLoss(model)
@@ -87,6 +91,7 @@ def main():
                          max(0.0, (total_steps - step) / max(total_steps - warmup_steps, 1))),
     )
 
+    # обучаем модель несколько раз по всем выбранным парам.
     global_step = 0
     for epoch in range(args.epochs):
         model.train()
@@ -106,6 +111,7 @@ def main():
         LOG.info("Epoch %s complete; mean loss=%.4f", epoch + 1,
                  epoch_loss / max(len(loader), 1))
 
+    # сохраняем модель, чтобы потом использовать ее для поиска.
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model.save(str(args.output_dir))
     LOG.info("Saved fine-tuned MiniLM to %s", args.output_dir)

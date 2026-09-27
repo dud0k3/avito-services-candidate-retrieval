@@ -1,4 +1,4 @@
-"""Evaluate a fine-tuned MiniLM dense retriever on held-out Avito queries."""
+"""проверяем поиск с дообученной моделью на отложенных запросах."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ BASE_WEIGHTS = np.array([0.285, 0.240, 0.225, 0.250], dtype=np.float32)
 
 
 def rank_fraction(scores):
+    # переводим оценки в ранги от слабого совпадения к сильному.
     order = np.argsort(scores, kind="stable")
     ranks = np.empty(len(scores), dtype=np.float32)
     ranks[order] = np.arange(len(scores), dtype=np.float32)
@@ -30,6 +31,7 @@ def rank_fraction(scores):
 
 
 def recall_candidates(pools, item_ids, positives):
+    # считаем, какая доля нужных объявлений вообще попала в общий список.
     vals = []
     for query, ids, _, _ in pools:
         relevant = positives[query]
@@ -38,6 +40,7 @@ def recall_candidates(pools, item_ids, positives):
 
 
 def select_local(ids, scores, local, limit=50):
+    # сначала берем объявления из нужного города, затем добираем остальные.
     selected = top_indices(ids[local], scores[local], limit)
     if len(selected) < limit:
         rest = top_indices(ids[~local], scores[~local], limit - len(selected))
@@ -56,17 +59,20 @@ def main():
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
+    # читаем данные и отделяем запросы, на которых будем проверять поиск.
     torch.set_num_threads(8)
     columns = list(dict.fromkeys(QUERY_COLS + ITEM_COLS))
     train = pd.read_parquet(args.data_dir / "train.parquet", columns=columns)
     queries, positives = make_validation(train, args.n_queries, args.seed)
     items = train.drop_duplicates("item_id").reset_index(drop=True)
+    # строим обычный текстовый поиск и готовим модель для векторов.
     retriever = CandidateRetriever(items)
     item_ids = retriever.item_ids
     n_items = len(items)
     model = SentenceTransformer(str(args.model_dir), device=args.device)
     model.max_seq_length = 64
 
+    # сохраняем векторы объявлений, чтобы не держать их все в памяти.
     args.embedding_file.parent.mkdir(parents=True, exist_ok=True)
     embeddings = np.lib.format.open_memmap(
         args.embedding_file, mode="w+", dtype=np.float16,
@@ -86,6 +92,7 @@ def main():
     del documents
     embeddings.flush()
 
+    # отдельно переводим запросы в векторы.
     query_texts = [build_query(row) for row in queries.itertuples(index=False)]
     query_vectors = model.encode(
         query_texts, batch_size=128, normalize_embeddings=True,
@@ -102,6 +109,7 @@ def main():
         for name, vectorizer in retriever.vectorizers.items()
     }
 
+    # для каждого запроса объединяем текстовые и смысловые совпадения.
     pools, cosine_scores, lexical_scores = [], [], []
     dense_only_predictions, lexical_predictions = [], []
     for query_index, query in enumerate(queries.itertuples(index=False)):
@@ -141,6 +149,7 @@ def main():
             LOG.info("Scored dense retrieval for %s/%s queries",
                      query_index + 1, len(queries))
 
+    # сравниваем обычный поиск, модель и несколько вариантов их смеси.
     print("tfidf_recall", recall_at_50(queries, lexical_predictions, positives), flush=True)
     print("finetuned_dense_recall", recall_at_50(queries, dense_only_predictions, positives), flush=True)
     print("tfidf_dense_union_candidate_recall",

@@ -1,8 +1,4 @@
-"""Candidate retrieval followed by a locally trained CatBoost reranker.
-
-Run with the supplied Parquet files and no network access. The model file is
-saved separately, so a second run can use exactly the same trained model.
-"""
+"""ищем объявления и выбираем лучшие с помощью catboost."""
 
 from __future__ import annotations
 
@@ -30,9 +26,10 @@ EXTRA_ITEM_COLS = ["item_rating_reviews_count"]
 
 
 class FeatureBuilder:
-    """Calculate the same query-item features for train and benchmark ads."""
+    """считает признаки пары запроса и объявления."""
 
     def __init__(self, items: pd.DataFrame):
+        # заранее готовим данные объявления, которые нужны модели.
         titles = [clean_text(x, 100) for x in items.item_title_raw]
         self.titles = titles
         self.title_tokens = [set(TOKENS.findall(x)) for x in titles]
@@ -42,6 +39,7 @@ class FeatureBuilder:
         self.log_reviews = np.log1p(reviews.to_numpy(dtype=np.float32))
 
     def transform(self, query, pool) -> np.ndarray:
+        # собираем признаки, по которым модель сравнит объявления.
         ids, similarities, same_location = pool
         query_text = clean_text(query.search_query)
         query_tokens = set(TOKENS.findall(query_text))
@@ -60,7 +58,8 @@ class FeatureBuilder:
 
 
 def fit_model(data_dir: Path, model_path: Path, n_contexts: int = 1200) -> CatBoostClassifier:
-    """Learn from clicked query-item pairs, with hard negatives from retrieval."""
+    """учит модель отличать выбранные объявления от остальных."""
+    # выбираем запросы для обучения и собираем список подходящих объявлений.
     columns = list(dict.fromkeys(QUERY_COLS + ITEM_COLS + EXTRA_ITEM_COLS))
     train = pd.read_parquet(data_dir / "train.parquet", columns=columns)
     train["signature"] = pd.util.hash_pandas_object(
@@ -80,6 +79,7 @@ def fit_model(data_dir: Path, model_path: Path, n_contexts: int = 1200) -> CatBo
     _, pools = retriever.retrieve(fit_queries, return_pools=True)
     features = FeatureBuilder(items)
 
+    # к выбранным объявлениям добавляем похожие и случайные примеры.
     random = np.random.default_rng(42)
     x_train, y_train = [], []
     for query, pool in zip(fit_queries.itertuples(index=False), pools):
@@ -100,6 +100,7 @@ def fit_model(data_dir: Path, model_path: Path, n_contexts: int = 1200) -> CatBo
     y_train = np.concatenate(y_train)
     LOG.info("Reranker training rows=%s, positives=%s", len(y_train), int(y_train.sum()))
 
+    # обучаем модель и сохраняем ее отдельно.
     model = CatBoostClassifier(
         iterations=500, depth=6, learning_rate=0.05, l2_leaf_reg=5,
         loss_function="Logloss", random_seed=42, thread_count=4, verbose=False,
@@ -112,7 +113,8 @@ def fit_model(data_dir: Path, model_path: Path, n_contexts: int = 1200) -> CatBo
 
 
 def predict(data_dir: Path, model: CatBoostClassifier, output: Path) -> None:
-    """Retrieve ads for each benchmark query and rerank up to 50 of them."""
+    """составляет до 50 ответов для каждого запроса."""
+    # для каждого запроса сначала находим кандидатов.
     queries = pd.read_parquet(data_dir / "benchmark_queries.parquet")
     items = pd.read_parquet(data_dir / "benchmark_items.parquet")
     retriever = CandidateRetriever(items)
@@ -120,6 +122,7 @@ def predict(data_dir: Path, model: CatBoostClassifier, output: Path) -> None:
     features = FeatureBuilder(items)
     predictions = []
 
+    # оцениваем кандидатов и оставляем до 50 лучших.
     for row_number, (query, pool) in enumerate(zip(queries.itertuples(index=False), pools)):
         if pool is None:
             predictions.append(retriever.item_ids[:50].tolist())
@@ -135,6 +138,7 @@ def predict(data_dir: Path, model: CatBoostClassifier, output: Path) -> None:
         if (row_number + 1) % 200 == 0:
             LOG.info("Reranked %s/%s queries", row_number + 1, len(queries))
 
+    # сохраняем таблицу после проверки формата и id.
     answer = pd.DataFrame({
         "query_id": queries.query_id.astype(str),
         "answer": [" ".join(ids) for ids in predictions],
@@ -155,6 +159,7 @@ def main():
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
+    # можно переучить модель или загрузить уже сохраненную.
     if args.retrain or not args.model.exists():
         model = fit_model(args.data_dir, args.model, args.train_queries)
         gc.collect()

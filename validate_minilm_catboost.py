@@ -1,3 +1,5 @@
+"""сравниваем catboost с поиском, в который добавлена minilm."""
+
 from __future__ import annotations
 
 import argparse
@@ -29,6 +31,7 @@ FEATURE_NAMES = [
 
 
 def select_local(ids, scores, local, limit=50):
+    # сначала оставляем объявления из города запроса.
     selected = top_indices(ids[local], scores[local], limit)
     if len(selected) < limit:
         rest = top_indices(ids[~local], scores[~local], limit - len(selected))
@@ -37,6 +40,7 @@ def select_local(ids, scores, local, limit=50):
 
 
 def recall_pools(pools, predictions, item_ids, positives):
+    # считаем, сколько выбранных объявлений попало в первые пятьдесят.
     values = []
     for (signature, ids, local, _), scores in zip(pools, predictions):
         chosen = select_local(ids, scores, local)
@@ -46,6 +50,7 @@ def recall_pools(pools, predictions, item_ids, positives):
 
 
 def oracle_recall(pools, item_ids, positives):
+    # проверяем, были ли нужные объявления среди всех найденных кандидатов.
     values = []
     for signature, ids, _, _ in pools:
         relevant = positives[signature]
@@ -54,6 +59,7 @@ def oracle_recall(pools, item_ids, positives):
 
 
 def rank_fraction(scores):
+    # приводим оценки к рангу, чтобы их можно было смешать.
     order = np.argsort(scores, kind="stable")
     ranks = np.empty(len(scores), dtype=np.float32)
     ranks[order] = np.arange(len(scores), dtype=np.float32)
@@ -61,12 +67,12 @@ def rank_fraction(scores):
 
 
 def fit_reranker(pools, positives, item_ids, seed=42):
+    # для обучения берем выбранные объявления и примеры, похожие на них.
     rng = np.random.default_rng(seed)
     x_parts, y_parts = [], []
     for signature, ids, _, x in pools:
         positive = np.isin(item_ids[ids], list(positives[signature]))
-        # Hard negatives are selected with the best retrieval blend measured
-        # before this reranker experiment (0.4 lexical rank + 0.6 dense rank).
+        # похожие сложные примеры берем из лучшей проверенной смеси поисков.
         lexical = x[:, :4] @ BASE_WEIGHTS
         lex_rank = rank_fraction(lexical)
         if x.shape[1] > 12:
@@ -83,6 +89,7 @@ def fit_reranker(pools, positives, item_ids, seed=42):
     x_train = np.concatenate(x_parts).astype(np.float32, copy=False)
     y_train = np.concatenate(y_parts)
     LOG.info("Reranker rows=%s, positives=%s", len(y_train), int(y_train.sum()))
+    # учим модель различать выбранные и остальные объявления.
     model = CatBoostClassifier(
         iterations=500, depth=6, learning_rate=0.05, l2_leaf_reg=5,
         loss_function="Logloss", random_seed=seed, thread_count=4,
@@ -93,6 +100,7 @@ def fit_reranker(pools, positives, item_ids, seed=42):
 
 
 def main():
+    # читаем данные и настраиваем проверку на выбранном seed.
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path, required=True)
@@ -107,6 +115,7 @@ def main():
 
     columns = list(dict.fromkeys(QUERY_COLS + ITEM_COLS + EXTRA_ITEM_COLS))
     train = pd.read_parquet(args.data_dir / "train.parquet", columns=columns)
+    # откладываем часть запросов и не используем их при обучении.
     valid_queries, valid_positives = make_validation(
         train, args.validation_queries, args.seed
     )
@@ -122,6 +131,7 @@ def main():
         if signature in fit_signatures:
             fit_positives[signature].add(str(item_id))
 
+    # готовим общий список объявлений и загружаем их векторы.
     items = train.drop_duplicates("item_id").reset_index(drop=True)
     retriever = CandidateRetriever(items)
     embeddings = np.load(args.embedding_file, mmap_mode="r")
@@ -130,6 +140,7 @@ def main():
     if embeddings.shape[1] != 384:
         raise ValueError(f"Expected MiniLM dimension 384, got {embeddings.shape[1]}")
 
+    # переводим запросы в векторы для смыслового поиска.
     model = SentenceTransformer(str(args.model_dir), device=args.device)
     model.max_seq_length = 64
     all_queries = pd.concat([fit_queries, valid_queries], ignore_index=True)
@@ -140,6 +151,7 @@ def main():
     ).astype(np.float32)
     del model
     item_tensor = torch.tensor(np.asarray(embeddings), device=args.device, dtype=torch.float16)
+    # находим текстовых кандидатов для всех запросов.
     LOG.info("Retrieving lexical candidates for %s contexts", len(all_queries))
     _, lexical_pools = retriever.retrieve(all_queries, return_pools=True)
     feature_builder = FeatureBuilder(items)
@@ -152,6 +164,7 @@ def main():
         for name, vectorizer in retriever.vectorizers.items()
     }
 
+    # соединяем кандидатов и признаки для двух вариантов catboost.
     lexical_feature_pools, hybrid_feature_pools = [], []
     lexical_only_preds, mini_only_preds, hybrid_blend_preds = [], [], []
     for q_index, (query, lexical_pool) in enumerate(
@@ -184,7 +197,7 @@ def main():
         dense_hit = np.isin(union_ids, dense_source_ids, assume_unique=True).astype(np.float32)
         hybrid_x = np.column_stack([base_features, dense_scores, dense_ranks, dense_hit]).astype(np.float32)
 
-        # The lexical model is trained and measured on the exact lexical pool.
+        # для обычной модели оставляем только текстовых кандидатов.
         if len(base_ids):
             positions = np.searchsorted(union_ids, base_ids)
             lexical_x = hybrid_x[positions, :12]
@@ -210,6 +223,7 @@ def main():
     fit_hybrid = hybrid_feature_pools[:len(fit_queries)]
     valid_lex = lexical_feature_pools[len(fit_queries):]
     valid_hybrid = hybrid_feature_pools[len(fit_queries):]
+    # учим две модели: на обычных кандидатах и на объединенном списке.
     base_model = fit_reranker(fit_lex, fit_positives, retriever.item_ids)
     hybrid_model = fit_reranker(fit_hybrid, fit_positives, retriever.item_ids)
 
@@ -218,6 +232,7 @@ def main():
     base_recall = recall_pools(valid_lex, base_scores, retriever.item_ids, valid_positives)
     hybrid_recall = recall_pools(valid_hybrid, hybrid_scores, retriever.item_ids, valid_positives)
 
+    # печатаем результаты, чтобы сравнить варианты на одних запросах.
     print("validation_queries", len(valid_queries), flush=True)
     print("train_queries", len(fit_queries), flush=True)
     print("tfidf_retrieval_recall", recall_at_50(valid_queries, lexical_only_preds, valid_positives), flush=True)

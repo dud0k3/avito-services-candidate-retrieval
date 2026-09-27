@@ -1,9 +1,4 @@
-"""Validate the CatBoost reranker against the lexical baseline.
-
-The validation search contexts are excluded from the reranker's training set.
-The candidate corpus contains all unique train items, matching retrieval.py's
-local validation setup. No benchmark labels are used.
-"""
+"""сравниваем catboost с поиском по тексту на отложенных запросах."""
 
 from __future__ import annotations
 
@@ -26,6 +21,7 @@ LOG = logging.getLogger(__name__)
 
 
 def rank_fraction(scores: np.ndarray) -> np.ndarray:
+    # превращаем оценки в места в списке от худшего к лучшему.
     order = np.argsort(scores, kind="stable")
     ranks = np.empty(len(scores), dtype=np.float32)
     ranks[order] = np.arange(len(scores), dtype=np.float32)
@@ -33,6 +29,7 @@ def rank_fraction(scores: np.ndarray) -> np.ndarray:
 
 
 def recall(pools, predictions, item_ids, positives):
+    # считаем среднюю долю выбранных объявлений в первых пятидесяти.
     values = []
     for (signature, ids, local, _), scores in zip(pools, predictions):
         local_ids = top_indices(ids[local], scores[local], 50)
@@ -45,6 +42,7 @@ def recall(pools, predictions, item_ids, positives):
 
 
 def main():
+    # читаем обучающие данные и выбираем отдельные запросы для проверки.
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--train-queries", type=int, default=1200)
@@ -59,6 +57,7 @@ def main():
     train["signature"] = pd.util.hash_pandas_object(
         train[QUERY_COLS].fillna(""), index=False
     ).to_numpy()
+    # не используем проверочные запросы для обучения модели.
     other_queries = train.drop_duplicates("signature")
     other_queries = other_queries[~other_queries.signature.isin(valid_queries.signature)]
     fit_queries = other_queries.sample(args.train_queries, random_state=2026).reset_index(drop=True)
@@ -68,6 +67,7 @@ def main():
         if sig in fit_sigs:
             fit_positives[sig].add(str(item_id))
     items = train.drop_duplicates("item_id")
+    # ищем кандидатов для запросов обучения и проверки одним способом.
     retriever = CandidateRetriever(items)
     combined_queries = pd.concat([fit_queries, valid_queries], ignore_index=True)
     _, candidate_pools = retriever.retrieve(combined_queries, return_pools=True)
@@ -79,6 +79,7 @@ def main():
     reviews = pd.to_numeric(items.item_rating_reviews_count, errors="coerce").fillna(0)
     log_reviews = np.log1p(reviews.to_numpy(dtype=np.float32))
 
+    # добавляем к кандидатам простые признаки: город, текст и оценки.
     feature_pools = []
     for row, pool in zip(combined_queries.itertuples(index=False), candidate_pools):
         ids, components, local = pool
@@ -97,6 +98,7 @@ def main():
         feature_pools.append((row.signature, ids, local, x))
     LOG.info("Constructed %s feature pools", len(feature_pools))
 
+    # готовим выбранные объявления, похожие варианты и случайные варианты.
     rng = np.random.default_rng(42)
     xfit, yfit = [], []
     for signature, ids, _, x in feature_pools[:len(fit_queries)]:
@@ -112,6 +114,7 @@ def main():
     yfit = np.concatenate(yfit)
     LOG.info("Training rows=%s positives=%s", len(yfit), int(yfit.sum()))
 
+    # учим catboost на собранных примерах.
     model = CatBoostClassifier(
         iterations=500, depth=6, learning_rate=0.05, l2_leaf_reg=5,
         loss_function="Logloss", random_seed=42, thread_count=4,
@@ -119,6 +122,7 @@ def main():
     )
     model.fit(xfit, yfit)
     valid_pools = feature_pools[len(fit_queries):]
+    # сравниваем catboost с простым смешиванием текстовых оценок.
     baseline_scores = [x[:, :4] @ BASE_WEIGHTS for _, _, _, x in valid_pools]
     model_scores = [model.predict_proba(x)[:, 1] for _, _, _, x in valid_pools]
     print("baseline", recall(valid_pools, baseline_scores, retriever.item_ids, valid_positives), flush=True)

@@ -24,7 +24,7 @@ QUERY_COLS = [
 
 
 def clean_text(value: object, limit: int | None = None) -> str:
-    """Keep text normalization deliberately small and deterministic."""
+    """приводит текст к общему виду перед поиском."""
     if not isinstance(value, str):
         return ""
     value = value.casefold().replace("ё", "е").replace("\xa0", " ")
@@ -32,6 +32,7 @@ def clean_text(value: object, limit: int | None = None) -> str:
 
 
 def top_indices(indices: np.ndarray, scores: np.ndarray, limit: int) -> np.ndarray:
+    # возвращаем номера объявлений с самыми высокими оценками.
     if limit <= 0:
         return indices[:0]
     if len(indices) <= limit:
@@ -43,6 +44,7 @@ def top_indices(indices: np.ndarray, scores: np.ndarray, limit: int) -> np.ndarr
 
 class CandidateRetriever:
     def __init__(self, items: pd.DataFrame):
+        # сохраняем id и город каждого объявления.
         self.items = items.reset_index(drop=True).copy()
         self.item_ids = self.items.item_id.astype(str).to_numpy()
         self.locations = self.items.item_location_id.fillna(-1).to_numpy(dtype=np.int64)
@@ -52,8 +54,7 @@ class CandidateRetriever:
         descriptions = [clean_text(x, 650) for x in self.items.item_description_raw]
         full = [f"{t} {t} {p} {d}" for t, p, d in zip(titles, params, descriptions)]
 
-        # The title is short and often directly names the service. The longer
-        # field catches cases where the service appears only in the description.
+        # заголовок часто сразу называет услугу, а полный текст помогает найти подробности.
         self.vectorizers = {
             "title_word": TfidfVectorizer(
                 min_df=2, max_df=0.9, max_features=200_000,
@@ -73,6 +74,7 @@ class CandidateRetriever:
             ),
         }
         self.matrices = {}
+        # строим отдельный поиск по каждому набору текстовых полей.
         for name, vectorizer in self.vectorizers.items():
             LOG.info("Vectorizing %s", name)
             texts = full if name == "full_word" else params if name == "params_word" else titles
@@ -88,6 +90,7 @@ class CandidateRetriever:
         source_limit: int = 150,
         return_pools: bool = False,
     ):
+        # чистим текст запроса и готовим его для каждого текстового поиска.
         query_texts = [clean_text(x) for x in queries.search_query]
         filter_texts = [clean_text(x, 250) for x in queries.search_infm_params_text]
         q_matrices = {
@@ -100,6 +103,7 @@ class CandidateRetriever:
         pools = []
 
         for row_number, row in enumerate(queries.itertuples(index=False)):
+            # собираем лучших кандидатов из каждого поиска.
             location = int(row.search_location_id)
             candidate_ids: set[int] = set()
             score_rows: dict[str, sparse.csr_matrix] = {}
@@ -118,8 +122,7 @@ class CandidateRetriever:
                         )
 
             if not candidate_ids:
-                # Very unusual empty or out-of-vocabulary query. The fallback
-                # remains deterministic and contains only corpus item IDs.
+                # если совпадений нет, возвращаем первые id из корпуса.
                 result.append(self.item_ids[:limit].tolist())
                 pools.append(None)
                 continue
@@ -142,11 +145,11 @@ class CandidateRetriever:
     @staticmethod
     def select(pool, local_quota: int, location_bonus: float, limit: int = 50,
                weights=(0.285, 0.240, 0.225, 0.250)) -> np.ndarray:
+        # складываем оценки и сначала выбираем объявления из нужного города.
         ids, components, is_local = pool
         combined = components @ np.asarray(weights, dtype=np.float32)
         combined += location_bonus * is_local
-        # The quota reserves some slots for ads in the search city, while the
-        # remaining slots can still go to local ads if their scores are high.
+        # после местных объявлений добираем лучшие оставшиеся варианты.
         local_ids = top_indices(ids[is_local], combined[is_local], min(local_quota, limit))
         used = np.isin(ids, local_ids)
         remaining = top_indices(ids[~used], combined[~used], limit - len(local_ids))
@@ -154,9 +157,9 @@ class CandidateRetriever:
 
 
 def make_validation(train: pd.DataFrame, n_queries: int, seed: int):
+    # делим одинаковые поисковые запросы на группы и выбираем часть для проверки.
     train = train.copy()
-    # Each unique combination is one search context. All its chosen ads form
-    # the relevance set; duplicate interactions with the same ad count once.
+    # для одного запроса сохраняем все выбранные объявления без повторов.
     train["signature"] = pd.util.hash_pandas_object(
         train[QUERY_COLS].fillna(""), index=False
     ).to_numpy()
@@ -171,6 +174,7 @@ def make_validation(train: pd.DataFrame, n_queries: int, seed: int):
 
 
 def recall_at_50(queries: pd.DataFrame, predictions: list[list[str]], positives: dict) -> float:
+    # считаем среднюю долю нужных объявлений среди первых пятидесяти.
     values = []
     for signature, guessed in zip(queries.signature, predictions):
         target = positives[signature]
@@ -179,6 +183,7 @@ def recall_at_50(queries: pd.DataFrame, predictions: list[list[str]], positives:
 
 
 def validate_output(queries: pd.DataFrame, items: pd.DataFrame, answer: pd.DataFrame):
+    # проверяем колонки, id, повторы и число объявлений в ответе.
     if list(answer.columns) != ["query_id", "answer"]:
         raise ValueError("CSV must have exactly query_id and answer columns")
     expected = set(queries.query_id.astype(str))
@@ -196,6 +201,7 @@ def validate_output(queries: pd.DataFrame, items: pd.DataFrame, answer: pd.DataF
 
 
 def main():
+    # читаем запросы и объявления, затем ищем кандидатов.
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("answer.csv"))
@@ -210,6 +216,7 @@ def main():
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
+    # при проверке берем метки из train, для ответа — запросы benchmark.
     if args.validate:
         columns = list(dict.fromkeys(QUERY_COLS + ITEM_COLS))
         train = pd.read_parquet(args.data_dir / "train.parquet", columns=columns)
@@ -229,6 +236,7 @@ def main():
     )
     predictions, pools = retrieved if args.sweep or args.diagnose else (retrieved, None)
     if args.validate:
+        # показываем качество поиска и при необходимости проверяем промахи.
         print(f"Recall@50: {recall_at_50(queries, predictions, positives):.6f}")
         if args.sweep:
             oracle = []
@@ -264,6 +272,7 @@ def main():
                           f"filters={row.search_infm_params_text!r} "
                           f"item={item_titles[item_id]!r}")
     else:
+        # записываем готовые id в нужный csv формат.
         answer = pd.DataFrame({
             "query_id": queries.query_id.astype(str),
             "answer": [" ".join(p) for p in predictions],
