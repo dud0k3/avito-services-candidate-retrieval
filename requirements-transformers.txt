@@ -1,3 +1,4 @@
-# Optional dependencies for the fine-tuned MiniLM experiments.
-sentence-transformers>=3.0,<6
-torch>=2.2
+# точные версии, с которыми собран сохраненный ответ.
+sentence-transformers==6.0.0
+torch==2.11.0
+transformers==5.15.0
