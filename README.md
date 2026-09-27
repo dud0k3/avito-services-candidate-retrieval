@@ -6,7 +6,7 @@
 
 В дополнительном эксперименте с rank fusion лучший результат составил **0,7845 на тех же 600 запросах**. Подбор веса на первой половине дал 0,8009 на ней, но только 0,7629 на второй половине; это не подтверждает устойчивое достижение 0,8. Сведения о вариантах fusion и ограничении из-за различия train- и benchmark-корпусов добавлены в отчёт.
 
-BGE-M3 я не дообучал: из-за размера модели посчитал эксперимент слишком затратным для доступных локальных ресурсов и сначала проверил MiniLM. Время запуска не измерял, поэтому это оценка по ресурсам, а не измеренный результат. Подробно описал выбор и ход экспериментов в отчёте.
+Хотел взять BGE-M3, но из-за размера модели посчитал эксперимент слишком затратным для доступных локальных ресурсов и сначала проверил MiniLM.
 
 ## Текущий рабочий вариант
 
@@ -18,42 +18,6 @@ BGE-M3 я не дообучал: из-за размера модели посч�
 4. Фильтры запроса сопоставляются с параметрами объявления.
 
 Помимо четырёх текстовых оценок, CatBoost получает совпадение локации, покрытие слов запроса заголовком, точное вхождение запроса, рейтинг, число отзывов и несколько простых признаков длины/наличия фильтра. Подробности и результаты по каждому источнику — в отчёте экспериментов.
-
-## Запуск решения
-
-Положите `train.parquet`, `benchmark_queries.parquet` и `benchmark_items.parquet` в один каталог. Данные в репозитории не хранятся.
-
-```bash
-python -m pip install -r requirements.txt
-python retrieval.py --data-dir /path/to/data --validate
-python validate_rerank.py --data-dir /path/to/data --train-queries 1200 --validation-queries 600 --seed 42
-python rerank.py --data-dir /path/to/data --model reranker.cbm --output answer.csv
-```
-
-Последняя команда сохраняет CSV и проверяет число запросов, формат ID, отсутствие дубликатов и лимит в 50 кандидатов. Добавьте `--retrain`, чтобы заново обучить CatBoost.
-
-## Эксперименты с MiniLM
-
-Экспериментальные скрипты доступны отдельно от production-пайплайна. Они не меняют `answer.csv` и текущую модель CatBoost. Нужны локальные данные и необязательные зависимости:
-
-```bash
-python -m pip install -r requirements-transformers.txt
-python finetune_minilm.py --data-dir /path/to/data \
-  --model-dir sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 \
-  --output-dir /path/to/finetuned-minilm --max-pairs 20000 \
-  --epochs 2 --batch-size 32 --seed 17
-
-python evaluate_finetuned_minilm.py --data-dir /path/to/data \
-  --model-dir /path/to/finetuned-minilm \
-  --embedding-file /path/to/cache/train_items.npy --n-queries 600 --seed 17
-
-python validate_minilm_catboost.py --data-dir /path/to/data \
-  --model-dir /path/to/finetuned-minilm \
-  --embedding-file /path/to/cache/train_items.npy \
-  --train-queries 1200 --validation-queries 600 --seed 17
-```
-
-Первый скрипт дообучает SentenceTransformer на парах «запрос — выбранное объявление», второй считает dense retrieval, третий сравнивает TF-IDF + CatBoost с TF-IDF ∪ MiniLM + CatBoost на одном и том же holdout. Веса модели и рассчитанные эмбеддинги не включены в Git: они занимают сотни мегабайт и строятся локально. Скрипты используют открытый `paraphrase-multilingual-MiniLM-L12-v2`; после загрузки весов обращения к внешним API нет.
 
 ## Ограничения
 
